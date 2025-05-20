@@ -6,21 +6,30 @@ const WebSocket = require('ws');
 // ###################################################################################
 // #                          USER CONFIGURATION                                     #
 // ###################################################################################
-const API_KEY = "TT2uTOk2mQjb2PQbBPoafu2fPzuhqqXuCEW2C01IWn9hKKQ6i0VxPSXcxW1O6fpefNt8dhPedKXPSUFPdRmA"
-const SECRET_KEY = "c85ZESkRp4rga2SWqgMYiy7fXqzmhNkh1nH9vf5Iyjw4dnliFxOSsNQPvsb9vwoBQ9FVxyxwIfcIRTD6Dqw"
+const API_KEY = "qhxtZWMafFAiFI8i6GAdwFfDdsPDSoNwHFpFEg1e4QDV9znMhImtHWS9wjR7ZM9Iz0Lau1Yw6JFOOgSXAfA"
+const SECRET_KEY = "o6YlTcQzmzDMocYsszuTbF7AXHdxZtSk4f76QPPWW1wSUQCMdRMUTJCRB3uR3g3Pn3PeLi4xyhf0qjTU7Q"
 const SYMBOL = "BTC-USDT";
-const LEVERAGE = 25; // 50x leverage
-const INITIAL_EQUITY_PERCENTAGE = 0.01; // 1% of equity for the first trade
+const LEVERAGE = 100; // 50x leverage
+let INITIAL_EQUITY_PERCENTAGE = 0.01; // 1% of equity for the first trade
 const MARTINGALE_MULTIPLIER = 1.5; // Double the position size for subsequent Martingale entries
 
 // Fee percentages (as decimals)
-const FEE_LIMIT = 0.00018; // 0.018%
-const FEE_MARKET = 0.0004;  // 0.04%
+const FEE_LIMIT = 0.000064; // 0.0064%
+const FEE_MARKET = 0.00016;  // 0.016%
 
 // Take Profit / Martingale Entry Logic Percentages (as decimals)
 const INITIAL_TAKE_PROFIT_PERCENTAGE = 0.00032; // 0.032% (Market buy price * (1 + 0.032%))
-const MARTINGALE_DROP_FEE_MULTIPLIER = 5; // Drop by (Limit Fee * 5) for Martingale limit buy
+const MARTINGALE_DROP_FEE_MULTIPLIER = 7; // Drop by (Limit Fee * 5) for Martingale limit buy
 const MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER = 2; // Take profit at (Avg Buy Price * (1 + Limit Fee * 2))
+const BASE_SLIPPAGE_PERCENT = 0.002; // 0.2% base slippage tolerance
+const MAX_SLIPPAGE_PERCENT = 0.005; // 0.5% maximum allowed slippage
+const MIN_PROFIT_PERCENT = 0.0005; // 0.05% minimum profit target
+const VOLATILITY_FACTOR = 3; // Multiplier for volatility-adjusted slippage
+const VOLATILITY_WINDOW = 60000; // 1 minute window for volatility calculation
+const MAX_VOLATILITY_THRESHOLD = 0.01; // 1% - pause trading if volatility exceeds this
+const BASE_COOLDOWN_PERIOD = 30000; // 30 seconds base cooling off period
+const VOLATILITY_COOLDOWN_MULTIPLIER = 2; // Cooldown multiplier for extreme volatility
+const MIN_POSITION_SIZE_FACTOR = 0.5; // Minimum position size during high volatility
 
 const API_BASE_URL = 'https://open-api.bingx.com';
 const WEBSOCKET_URL = 'wss://open-api-swap.bingx.com/swap-market';
@@ -58,6 +67,8 @@ let ws = null;
 let isBotActive = false; // To control the bot's operation loop
 let lastMarketBuyPrice = 0; // Price of the very first market buy of a cycle
 let lastMartingaleBuyPrice = 0; // Price of the last filled Martingale buy order
+let isCoolingDown = false; // Flag for volatility-induced cooldown
+let lastVolatilityAlert = 0; // Time of last volatility alert
 
 
 // ###################################################################################
@@ -281,7 +292,29 @@ async function placeOrder(symbol, side, positionSide, type, quantity, price = nu
     if (quantity <= 0) {
         throw new Error('Invalid order quantity');
     }
-    if (type === 'LIMIT' && !price) {
+    
+    // Get fresh price data for market orders
+    if (type === 'MARKET') {
+        const currentPrice = await getCurrentBtcPrice();
+        if (side === 'BUY') {
+            // Calculate dynamic slippage and position adjustment based on recent volatility
+            const recentVolatility = calculateRecentVolatility();
+            const dynamicSlippage = BASE_SLIPPAGE_PERCENT * (1 + (recentVolatility * VOLATILITY_FACTOR));
+            const positionSizeFactor = Math.max(MIN_POSITION_SIZE_FACTOR, 1 - (recentVolatility * 10));
+            
+            // Adjust buy price and quantity with volatility-based scaling
+            price = currentPrice * (1 + dynamicSlippage);
+            quantity *= positionSizeFactor;
+        } else {
+            // Calculate dynamic slippage based on recent volatility
+            const recentVolatility = calculateRecentVolatility();
+            const dynamicSlippage = BASE_SLIPPAGE_PERCENT * (1 + (recentVolatility * VOLATILITY_FACTOR));
+            
+            // Adjust sell price with dynamic slippage tolerance
+            price = currentPrice * (1 - dynamicSlippage);
+        }
+        console.log(`Adjusted ${type} ${side} price with dynamic slippage tolerance: ${price}`);
+    } else if (type === 'LIMIT' && !price) {
         throw new Error('Limit orders require a price');
     }
     
@@ -292,7 +325,8 @@ async function placeOrder(symbol, side, positionSide, type, quantity, price = nu
         positionSide,
         type,
         quantity: quantity.toString(),
-        isMartingale: (type === 'LIMIT' && side === 'BUY') // Mark martingale buy orders
+        isMartingale: (type === 'LIMIT' && side === 'BUY'), // Mark martingale buy orders
+        timeInForce: 'GTC' // Good-Til-Canceled to maintain orders through volatility
     };
 
     if (price !== null) {
@@ -477,8 +511,8 @@ function connectWebSocket() {
     }
     
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('Maximum reconnect attempts reached. Please restart the bot.');
-        isBotActive = false;
+        console.log('Maximum reconnect attempts reached. Resetting counter and trying again...');
+        reconnectAttempts = 0; // Reset counter instead of stopping
         return;
     }
 
@@ -631,6 +665,9 @@ async function handleWebSocketMessage(message) {
     if (message.e === 'ORDER_TRADE_UPDATE') {
         const orderData = message.o;
         if (orderData.X === 'FILLED') {
+            // Get fresh price data to handle rapid market movements
+            const currentPrice = await getCurrentBtcPrice();
+            
             console.log(`Order Update [${orderData.X}]:`, {
                 symbol: orderData.s,
                 side: orderData.S,
@@ -642,7 +679,30 @@ async function handleWebSocketMessage(message) {
                 executionType: orderData.x,
                 status: orderData.X,
                 time: orderData.T,
+                currentMarketPrice: currentPrice // Log current price for comparison
             });
+
+            // Validate filled price against expected range
+            if (orderData.X === 'FILLED') {
+                const filledPrice = parseFloat(orderData.p);
+                let expectedPrice = lastMarketBuyPrice;
+                
+                if (orderData.o === 'MARKET' && orderData.S === 'BUY') {
+                    expectedPrice = lastMarketBuyPrice * (1 + BASE_SLIPPAGE_PERCENT * 2); // Allow 2x base slippage
+                } else if (orderData.o === 'LIMIT' && orderData.S === 'BUY') {
+                    expectedPrice = lastMartingaleBuyPrice * (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER));
+                }
+                
+                if (expectedPrice > 0) {
+                    const priceDifference = Math.abs((filledPrice - expectedPrice) / expectedPrice);
+                    if (priceDifference > BASE_SLIPPAGE_PERCENT * 2) { // Use 2x base slippage as threshold
+                        console.warn(`Large price deviation detected: ${(priceDifference * 100).toFixed(2)}%`);
+                        // Adjust strategy for unexpected fill price
+                        currentMartingaleLevel = Math.min(currentMartingaleLevel, 2); // Reduce martingale levels
+                        console.log(`Martingale level reduced to ${currentMartingaleLevel} due to price deviation`);
+                    }
+                }
+            }
 
             // Handle filled orders
             if (orderData.X === 'FILLED') {
@@ -653,6 +713,13 @@ async function handleWebSocketMessage(message) {
                     currentPosition.averageEntryPrice = lastMarketBuyPrice;
                     currentPosition.entryValueUSD = currentPosition.quantity * lastMarketBuyPrice;
                     currentPosition.side = 'LONG';
+
+                    // Immediately place new market buy order after fill
+                    if (currentPosition.quantity === 0) {
+                        setTimeout(() => {
+                            executeInitialMarketBuy().catch(console.error);
+                        }, 1000); // 1 second delay before next buy
+                    }
 
                     // Update volume stats
                     const tradeQty = parseFloat(orderData.q);
@@ -746,34 +813,64 @@ async function handleWebSocketMessage(message) {
                     });
                     updateVolumeStats();
 
-                    // 1. Cancel all martingale orders
+                    // 1. Cancel all martingale orders with proper async/await
+                    console.log('Starting cancellation of martingale orders...');
                     const allOpenOrders = await getOpenOrders(SYMBOL);
-                    for (const order of allOpenOrders) {
-                        if (order.isMartingale) {
-                            await cancelOrder(SYMBOL, order.orderId);
+                    const cancellationPromises = allOpenOrders
+                        .filter(order => order.isMartingale)
+                        .map(order => cancelOrder(SYMBOL, order.orderId));
+                    
+                    await Promise.all(cancellationPromises);
+                    console.log('All martingale orders cancelled');
+
+                    // 2. Reset trading environment with verification
+                    console.log('Resetting trading environment...');
+                    await cancelAllOpenOrdersAndReset(orderData.s);
+                    console.log('Trading environment reset complete');
+
+                    // 3. Adjust initial equity percentage conservatively
+                    const originalEquityPercentage = 0.01;
+                    const minEquityPercentage = 0.005; // Minimum 0.5%
+                    const reductionFactor = 0.8; // Reduce by 20% each cycle
+                    
+                    INITIAL_EQUITY_PERCENTAGE = Math.max(
+                        minEquityPercentage,
+                        INITIAL_EQUITY_PERCENTAGE * reductionFactor
+                    );
+                    
+                    console.log(`Adjusted initial equity percentage to ${(INITIAL_EQUITY_PERCENTAGE * 100).toFixed(2)}% for next cycle`);
+
+                    // 4. Start new trading cycle with proper sequencing
+                    if (isBotActive) {
+                        console.log('Preparing to start new trading cycle...');
+                        currentMartingaleLevel = 0; // Reset martingale level
+                        
+                        // Add delay to ensure clean state
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        
+                        // Verify no open orders remain
+                        const remainingOrders = await getOpenOrders(SYMBOL);
+                        if (remainingOrders.length === 0) {
+                            console.log('Starting new conservative trading cycle');
+                            await executeInitialMarketBuy();
+                        } else {
+                            console.error('Cannot start new cycle - open orders still exist:', remainingOrders);
                         }
                     }
-                    
-                    // 2. Reset trading environment
-                    await cancelAllOpenOrdersAndReset(orderData.s);
-                    
-                    // 3. Start new trading cycle with initial market buy
-                    if (isBotActive) {
-                        console.log('Starting new trading cycle after successful position close');
-                        currentMartingaleLevel = 0; // Reset martingale level
-                        executeInitialMarketBuy(); // Start new cycle with fresh market buy
-                    }
-                } else if (orderData.X === 'FILLED' && orderData.S === 'SELL') {
-                    console.log('Long position closed. Cancelling all orders and restarting...');
+                } else if (orderData.X === 'FILLED' && orderData.S === 'SELL' && orderData.ps === 'LONG') {
+                    console.log('Long position closed. Immediately restarting trading cycle...');
                     
                     // 1. Cancel all open orders
                     await cancelAllOpenOrdersAndReset(orderData.s);
                     
-                    // 2. Start new trading cycle
+                    // 2. Reset initial equity percentage to original value
+                    INITIAL_EQUITY_PERCENTAGE = 0.01;
+                    
+                    // 3. Immediately execute new market buy if bot is active
                     if (isBotActive) {
-                        console.log('Starting new trading cycle after position close');
-                        currentMartingaleLevel = 0; // Reset martingale level
-                        executeInitialMarketBuy(); // Start new cycle
+                        currentMartingaleLevel = 0;
+                        console.log('Immediately placing new market buy order');
+                        await executeInitialMarketBuy();
                     }
                 }
             }
@@ -926,6 +1023,7 @@ async function cancelAllOpenOrdersAndReset(symbol) {
 /**
  * Updates volume statistics and cleans up old trade data
  */
+let priceHistory = [];
 function updateVolumeStats() {
     const now = Date.now();
     // Clean up trades older than 1 hour
@@ -944,6 +1042,82 @@ function updateVolumeStats() {
         .reduce((sum, t) => sum + t.quantity, 0);
         
     volumeStats.lastUpdate = now;
+
+    // Update price history for volatility calculation
+    const currentPrice = priceCache.value;
+    if (currentPrice > 0) {
+        priceHistory.push({
+            price: currentPrice,
+            time: now
+        });
+        // Keep only prices from the last VOLATILITY_WINDOW
+        priceHistory = priceHistory.filter(p => p.time > now - VOLATILITY_WINDOW);
+    }
+}
+
+function calculateRecentVolatility() {
+    if (priceHistory.length < 2) return 0;
+    
+    const priceChanges = [];
+    let upwardMoves = 0;
+    let downwardMoves = 0;
+    let maxDrop = 0;
+    let maxRise = 0;
+    
+    for (let i = 1; i < priceHistory.length; i++) {
+        const change = (priceHistory[i].price - priceHistory[i-1].price) / priceHistory[i-1].price;
+        const absChange = Math.abs(change);
+        priceChanges.push(absChange);
+        
+        if (change > 0) {
+            upwardMoves++;
+            maxRise = Math.max(maxRise, change);
+        } else if (change < 0) {
+            downwardMoves++;
+            maxDrop = Math.min(maxDrop, change);
+        }
+    }
+    
+    const averageChange = priceChanges.reduce((sum, change) => sum + change, 0) / priceChanges.length;
+    const netDirection = upwardMoves - downwardMoves;
+    const volatilityRatio = maxRise / Math.abs(maxDrop) || 1;
+    
+    // Enhanced volatility logging
+    if (averageChange > MAX_VOLATILITY_THRESHOLD * 0.8) {
+        const logMessage = `Volatility: ${(averageChange*100).toFixed(2)}% ` +
+                          `(Up: ${upwardMoves}, Down: ${downwardMoves}) ` +
+                          `Max Rise: ${(maxRise*100).toFixed(2)}%, Max Drop: ${(maxDrop*100).toFixed(2)}%`;
+        
+        if (averageChange > MAX_VOLATILITY_THRESHOLD && Date.now() - lastVolatilityAlert > 30000) {
+            console.warn(`HIGH VOLATILITY - ${logMessage}`);
+            lastVolatilityAlert = Date.now();
+        } else {
+            console.log(logMessage);
+        }
+    }
+    
+    return averageChange * (volatilityRatio > 2 ? 1.2 : 1); // Adjust volatility measure for strong trends
+}
+
+function activateCooldown(currentVolatility) {
+    // Calculate adaptive cooldown duration based on volatility severity
+    const severity = currentVolatility / MAX_VOLATILITY_THRESHOLD;
+    const duration = BASE_COOLDOWN_PERIOD * Math.min(VOLATILITY_COOLDOWN_MULTIPLIER, severity);
+    
+    isCoolingDown = true;
+    console.log(`Starting cooldown for ${(duration/1000).toFixed(1)} seconds due to ${(currentVolatility*100).toFixed(2)}% volatility`);
+    
+    // Cancel all pending orders when entering cooldown
+    cancelAllOpenOrders(SYMBOL).then(() => {
+        console.log('All pending orders cancelled during cooldown');
+    }).catch(err => {
+        console.error('Error cancelling orders during cooldown:', err);
+    });
+    
+    setTimeout(() => {
+        isCoolingDown = false;
+        console.log('Cooldown period ended, resuming trading');
+    }, duration);
 }
 
 /**
@@ -993,21 +1167,37 @@ function adjustPricePrecision(price) {
 }
 
 async function executeInitialMarketBuy() {
-    if (isCancellingOrders) {
-        console.log('Skipping market buy - order cancellation in progress');
+    if (isCancellingOrders || isCoolingDown) {
+        const reason = isCancellingOrders ? 'order cancellation in progress' : 'cooling down after high volatility';
+        console.log(`Skipping market buy - ${reason}`);
+        return;
+    }
+    
+    // Check current volatility before proceeding
+    const currentVolatility = calculateRecentVolatility();
+    if (currentVolatility > MAX_VOLATILITY_THRESHOLD) {
+        console.warn(`Volatility too high (${(currentVolatility*100).toFixed(2)}%), entering cooldown`);
+        activateCooldown(currentVolatility);
+        return;
+    }
+    
+    // Reduce position size if volatility is elevated but below threshold
+    if (currentVolatility > MAX_VOLATILITY_THRESHOLD * 0.7) {
+        const reduction = 1 - (currentVolatility / MAX_VOLATILITY_THRESHOLD);
+        quantity *= Math.max(MIN_POSITION_SIZE_FACTOR, reduction);
+        console.log(`Reducing position size to ${(quantity.toFixed(6))} due to elevated volatility`);
+    }
+
+    // Additional check for consecutive volatility spikes
+    if (Date.now() - lastVolatilityAlert < BASE_COOLDOWN_PERIOD * 2) {
+        console.warn('Recent volatility alerts detected, extending cooldown');
+        activateCooldown(BASE_COOLDOWN_PERIOD * 2);
         return;
     }
     console.log('Executing initial market buy...');
     try {
-        const currentPrice = await getCurrentBtcPrice();
-        const balance = await getAccountBalance();
-        const quantity = calculateQuantity(balance, INITIAL_EQUITY_PERCENTAGE, currentPrice, LEVERAGE);
-        
-        if (quantity <= 0) {
-            console.error('Invalid calculated quantity for initial buy');
-            return;
-        }
-        
+        const quantity = 0.0001; // Fixed quantity for initial entry
+
         console.log(`Placing initial market buy for ${quantity} ${SYMBOL}`);
         const order = await placeOrder(
             SYMBOL,
@@ -1016,7 +1206,7 @@ async function executeInitialMarketBuy() {
             'MARKET',
             quantity
         );
-        
+
         if (order) {
             currentPosition.openOrderId = order.orderId;
             console.log('Initial market buy order placed:', order);
@@ -1131,7 +1321,12 @@ async function placeNextMartingaleStageOrders() {
         }
 
         // 4. Calculate next martingale buy price and quantity
-        if (currentMartingaleLevel < 5) {
+        // Calculate required margin for next level
+        const requiredMargin = nextBuyQuantity * nextBuyPrice / LEVERAGE;
+        const currentBalance = await getAccountBalance();
+        
+        // Allow up to 10 levels if sufficient balance (2x required margin)
+        if (currentMartingaleLevel < 10 && currentBalance > requiredMargin * 2) {
             const nextBuyPrice = adjustPricePrecision(
                 currentPosition.averageEntryPrice *
                 (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER))
@@ -1193,7 +1388,9 @@ async function initializeBot() {
         // Start keep-alive interval for listen key (every 30 minutes)
         setInterval(() => {
             if (activeListenKey) {
-                keepAliveListenKey(activeListenKey);
+                keepAliveListenKey(activeListenKey).catch(err => {
+                    console.error('Error keeping listen key alive:', err);
+                });
             }
         }, 30 * 60 * 1000);
         
@@ -1201,12 +1398,49 @@ async function initializeBot() {
         setInterval(() => {
             displayVolumeStats();
         }, 5000);
+
+        // Enhanced watchdog timer with backoff strategy
+        let watchdogAttempts = 0;
+        const watchdogInterval = setInterval(() => {
+            if (!isBotActive) {
+                watchdogAttempts++;
+                const delay = Math.min(1000 * Math.pow(2, watchdogAttempts), 30000);
+                console.log(`Watchdog: Bot inactive, attempting to restart in ${delay/1000} seconds (attempt ${watchdogAttempts})...`);
+                setTimeout(() => {
+                    initializeBot().then(() => {
+                        watchdogAttempts = 0;
+                    });
+                }, delay);
+            } else {
+                watchdogAttempts = 0;
+            }
+        }, 60000);
         
-        // Start the first trading cycle
-        runBotCycle();
+        // Start the first trading cycle with retry logic
+        const maxRetries = 5;
+        let retries = 0;
+        const startCycle = async () => {
+            try {
+                await runBotCycle();
+            } catch (error) {
+                console.error('Error starting trading cycle:', error);
+                if (retries < maxRetries) {
+                    retries++;
+                    const delay = Math.min(1000 * retries, 5000);
+                    console.log(`Retrying cycle start in ${delay}ms (attempt ${retries}/${maxRetries})`);
+                    setTimeout(startCycle, delay);
+                }
+            }
+        };
+        startCycle();
     } catch (error) {
         console.error('Error initializing bot:', error);
-        isBotActive = false;
+        // Enhanced restart logic with exponential backoff
+        const delay = Math.min(10000 * (1 + Math.random()), 30000); // Random delay up to 30s
+        console.log(`Attempting to reinitialize bot in ${Math.round(delay/1000)} seconds...`);
+        setTimeout(() => {
+            initializeBot();
+        }, delay);
     }
 }
 

@@ -1223,14 +1223,31 @@ async function placeInitialFollowUpOrders() {
         console.log('Skipping follow-up orders - order cancellation in progress');
         return;
     }
-    console.log('Placing initial follow-up orders...');
+    
+    console.log('Placing volatility-adjusted follow-up orders...');
     try {
-        // Place Take Profit order
+        const recentVolatility = calculateRecentVolatility();
+        const dynamicFeeMultiplier = Math.min(
+            MARTINGALE_DROP_FEE_MULTIPLIER * (1 + recentVolatility * 2),
+            MARTINGALE_DROP_FEE_MULTIPLIER * 3
+        );
+
+        // Calculate Take Profit price with volatility adjustment
         const takeProfitPrice = adjustPricePrecision(
-            currentPosition.averageEntryPrice * (1 + 2 * FEE_LIMIT)
+            currentPosition.averageEntryPrice *
+            (1 + Math.max(
+                2 * FEE_LIMIT * (1 - recentVolatility),
+                MIN_PROFIT_PERCENT
+            ))
         );
         
-        console.log(`Placing initial take profit limit order at ${takeProfitPrice}`);
+        console.log('Placing take profit order:', {
+            basePrice: currentPosition.averageEntryPrice,
+            takeProfitPrice: takeProfitPrice,
+            volatility: recentVolatility,
+            feeMultiplier: 2 * (1 - recentVolatility)
+        });
+
         const tpOrder = await placeOrder(
             SYMBOL,
             'SELL',
@@ -1242,17 +1259,29 @@ async function placeInitialFollowUpOrders() {
         
         if (tpOrder) {
             currentPosition.takeProfitOrderId = tpOrder.orderId;
-            console.log('Take profit order placed:', tpOrder);
+            console.log('Take profit order placed:', {
+                orderId: tpOrder.orderId,
+                price: takeProfitPrice,
+                quantity: currentPosition.quantity,
+                volatility: recentVolatility
+            });
         } else {
             console.error('Failed to place take profit order');
         }
-        
-        // Place next Martingale buy order
+
+        // Calculate Martingale Buy price with volatility adjustment
         const martingaleBuyPrice = adjustPricePrecision(
-            lastMarketBuyPrice * (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER))
+            lastMarketBuyPrice *
+            (1 - (FEE_LIMIT * dynamicFeeMultiplier))
         );
         
-        console.log(`Placing martingale buy order at ${martingaleBuyPrice}`);
+        console.log('Placing martingale buy order:', {
+            basePrice: lastMarketBuyPrice,
+            martingalePrice: martingaleBuyPrice,
+            volatility: recentVolatility,
+            feeMultiplier: dynamicFeeMultiplier
+        });
+
         const mbOrder = await placeOrder(
             SYMBOL,
             'BUY',
@@ -1264,12 +1293,23 @@ async function placeInitialFollowUpOrders() {
         
         if (mbOrder) {
             currentPosition.martingaleBuyOrderId = mbOrder.orderId;
-            console.log('Martingale buy order placed:', mbOrder);
+            console.log('Martingale buy order placed:', {
+                orderId: mbOrder.orderId,
+                price: martingaleBuyPrice,
+                quantity: currentPosition.quantity * MARTINGALE_MULTIPLIER,
+                martingaleLevel: 1,
+                volatility: recentVolatility
+            });
         } else {
             console.error('Failed to place martingale buy order');
         }
     } catch (error) {
-        console.error('Error placing follow-up orders:', error);
+        console.error('Error placing follow-up orders:', {
+            error: error.message,
+            stack: error.stack,
+            position: currentPosition,
+            timestamp: Date.now()
+        });
     }
 }
 

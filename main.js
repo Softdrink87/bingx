@@ -12,6 +12,8 @@ const SYMBOL = "BTC-USDT";
 const LEVERAGE = 100; // 50x leverage
 let INITIAL_EQUITY_PERCENTAGE = 0.01; // 1% of equity for the first trade
 const MARTINGALE_MULTIPLIER = 1.5; // Double the position size for subsequent Martingale entries
+const MAX_MARTINGALE_ENTRIES = 6; // Maximum martingale attempt count
+const EXIT_ROI_THRESHOLD = -0.10; // Position liquidation threshold when ROI <= -10%
 
 // Fee percentages (as decimals)
 const FEE_LIMIT = 0.000064; // 0.0064%
@@ -30,6 +32,7 @@ const MAX_VOLATILITY_THRESHOLD = 0.01; // 1% - pause trading if volatility excee
 const BASE_COOLDOWN_PERIOD = 30000; // 30 seconds base cooling off period
 const VOLATILITY_COOLDOWN_MULTIPLIER = 2; // Cooldown multiplier for extreme volatility
 const MIN_POSITION_SIZE_FACTOR = 0.5; // Minimum position size during high volatility
+
 
 const API_BASE_URL = 'https://open-api.bingx.com';
 const WEBSOCKET_URL = 'wss://open-api-swap.bingx.com/swap-market';
@@ -728,9 +731,6 @@ async function handleWebSocketMessage(message) {
                         time: Date.now()
                     });
                     updateVolumeStats();
-                    
-                    // Place initial take profit and next martingale buy orders
-                    placeInitialFollowUpOrders().catch(console.error);
                 } else if (orderData.o === 'LIMIT' && orderData.S === 'BUY') {
                     console.log('Martingale buy order filled.');
                     lastMartingaleBuyPrice = parseFloat(orderData.p);
@@ -738,68 +738,23 @@ async function handleWebSocketMessage(message) {
                     
                     // Update volume stats
                     const tradeQty = parseFloat(orderData.q);
-                    volumeStats.trades.push({
-                        quantity: tradeQty,
-                        time: Date.now()
-                    });
+                    volumeStats.trades.push({ quantity: tradeQty, time: Date.now() });
                     updateVolumeStats();
-
-                    // 1. Cancel all existing martingale orders
-                    const martingaleOrders = await getOpenOrders(SYMBOL);
-                    for (const order of martingaleOrders) {
-                        if (order.isMartingale) {
-                            await cancelOrder(SYMBOL, order.orderId);
-                        }
-                    }
-
-                    // 2. Get fresh position data from exchange
-                    const exchangePosition = await getCurrentPosition(SYMBOL);
-                    if (exchangePosition) {
-                        currentPosition.quantity = exchangePosition.quantity;
-                        currentPosition.averageEntryPrice = exchangePosition.averageEntryPrice;
-                    }
                     
-                    // 3. Place new take profit for entire position
-                    const takeProfitPrice = adjustPricePrecision(
-                        currentPosition.averageEntryPrice *
-                        (1 + (FEE_LIMIT * MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER))
-                    );
-                    
-                    console.log(`Placing new take profit for ${currentPosition.quantity} @ ${takeProfitPrice}`);
-                    const tpOrder = await placeOrder(
-                        SYMBOL,
-                        'SELL',
-                        'LONG',
-                        'LIMIT',
-                        currentPosition.quantity,
-                        takeProfitPrice
-                    );
-                    
-                    if (tpOrder) {
-                        currentPosition.takeProfitOrderId = tpOrder.orderId;
-                    }
-
-                    // 4. Place next martingale buy order if under max level
-                    if (currentMartingaleLevel < 5) {
-                        const nextBuyPrice = adjustPricePrecision(
-                            lastMartingaleBuyPrice *
-                            (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER))
-                        );
-                        
-                        const nextBuyQuantity = currentPosition.quantity * MARTINGALE_MULTIPLIER;
-                        
-                        console.log(`Placing next martingale buy for ${nextBuyQuantity} @ ${nextBuyPrice}`);
-                        const buyOrder = await placeOrder(
-                            SYMBOL,
-                            'BUY',
-                            'LONG',
-                            'LIMIT',
-                            nextBuyQuantity,
-                            nextBuyPrice
-                        );
-                        
-                        if (buyOrder) {
-                            currentPosition.martingaleBuyOrderId = buyOrder.orderId;
+                    if (currentMartingaleLevel < MAX_MARTINGALE_ENTRIES) {
+                        await placeNextMartingaleStageOrders().catch(console.error);
+                    } else {
+                        const currentPrice = await getCurrentBtcPrice();
+                        const roi = (currentPrice - currentPosition.averageEntryPrice) / currentPosition.averageEntryPrice;
+                        if (roi <= EXIT_ROI_THRESHOLD) {
+                            console.log(`Martingale limit reached and ROI ${roi.toFixed(4)} <= ${EXIT_ROI_THRESHOLD} threshold. Exiting position.`);
+                            const sellOrder = await placeOrder(SYMBOL, 'SELL', 'LONG', 'MARKET', currentPosition.quantity);
+                            if (sellOrder) {
+                                console.log('Market SELL order placed to exit position.');
+                                await cancelAllOpenOrdersAndReset(SYMBOL);
+                            }
+                        } else {
+                            console.log(`Maximum martingale entries reached, but ROI ${roi.toFixed(4)} is above exit threshold. No further action.`);
                         }
                     }
                 } else if (orderData.o === 'TAKE_PROFIT_MARKET' && orderData.S === 'SELL') {
@@ -843,7 +798,21 @@ async function handleWebSocketMessage(message) {
                     // 4. Start new trading cycle with proper sequencing
                     if (isBotActive) {
                         console.log('Preparing to start new trading cycle...');
-                        currentMartingaleLevel = 0; // Reset martingale level
+                        currentMartingaleLevel++; // Increment martingale level
+                        
+                        if (currentMartingaleLevel >= MAX_MARTINGALE_ENTRIES) {
+                            const currentPrice = parseFloat(data.p);
+                            const roi = (currentPrice / entryPrice) - 1;
+                            
+                            if (roi <= EXIT_ROI_THRESHOLD) {
+                                console.log(`Max martingale entries reached (${MAX_MARTINGALE_ENTRIES}) with ROI ${(roi*100).toFixed(2)}% - executing market exit`);
+                                await createMarketOrder(SYMBOL, 'sell', position.size);
+                            } else {
+                                console.log(`Max martingale entries reached (${MAX_MARTINGALE_ENTRIES}) but ROI ${(roi*100).toFixed(2)}% above threshold - holding position`);
+                            }
+                        } else {
+                            console.log(`Current martingale level: ${currentMartingaleLevel}/${MAX_MARTINGALE_ENTRIES}`);
+                        }
                         
                         // Add delay to ensure clean state
                         await new Promise(resolve => setTimeout(resolve, 1000));

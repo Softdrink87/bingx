@@ -11,7 +11,7 @@ const SECRET_KEY = "o6YlTcQzmzDMocYsszuTbF7AXHdxZtSk4f76QPPWW1wSUQCMdRMUTJCRB3uR
 const SYMBOL = "BTC-USDT";
 const LEVERAGE = 100; // 50x leverage
 const INITIAL_EQUITY_PERCENTAGE = 0.01; // 1% of equity for the first trade
-const MARTINGALE_MULTIPLIER = 1.3; // Double the position size for subsequent Martingale entries
+const MARTINGALE_MULTIPLIER = 1.5; // Double the position size for subsequent Martingale entries
 
 // Fee percentages (as decimals)
 const FEE_LIMIT = 0.000064; // 0.0064%
@@ -19,8 +19,8 @@ const FEE_MARKET = 0.00016;  // 0.016%
 
 // Take Profit / Martingale Entry Logic Percentages (as decimals)
 const INITIAL_TAKE_PROFIT_PERCENTAGE = 0.00032; // 0.032% (Market buy price * (1 + 0.032%))
-const MARTINGALE_DROP_FEE_MULTIPLIER = 9; // Drop by (Limit Fee * 5) for Martingale limit buy
-const MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER = 1.8; // Take profit at (Avg Buy Price * (1 + Limit Fee * 2))
+const MARTINGALE_DROP_FEE_MULTIPLIER = 7; // Drop by (Limit Fee * 5) for Martingale limit buy
+const MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER = 2; // Take profit at (Avg Buy Price * (1 + Limit Fee * 2))
 
 const API_BASE_URL = 'https://open-api.bingx.com';
 const WEBSOCKET_URL = 'wss://open-api-swap.bingx.com/swap-market';
@@ -630,8 +630,8 @@ function connectWebSocket() {
 async function handleWebSocketMessage(message) {
     if (message.e === 'ORDER_TRADE_UPDATE') {
         const orderData = message.o;
-        if (orderData.X === 'FILLED' || orderData.X === 'PARTIALLY_FILLED') {
-            console.log(`[DEBUG] Order Update [${orderData.X}]:`, {
+        if (orderData.X === 'FILLED') {
+            console.log(`Order Update [${orderData.X}]:`, {
                 symbol: orderData.s,
                 side: orderData.S,
                 type: orderData.o,
@@ -642,33 +642,10 @@ async function handleWebSocketMessage(message) {
                 executionType: orderData.x,
                 status: orderData.X,
                 time: orderData.T,
-                martingaleLevel: currentMartingaleLevel,
-                positionSize: currentPosition.quantity,
-                isMartingaleOrder: orderData.ci === 'MARTINGALE'
             });
 
-            // Martingale stage tracking
-            console.log(`[MARTINGALE] Current stage: ${currentMartingaleLevel},
-                Position: ${currentPosition.quantity},
-                OpenOrder: ${currentPosition.openOrderId},
-                TPOrder: ${currentPosition.takeProfitOrderId}`);
-
-            // Handle filled and partially filled orders
-            if (orderData.X === 'FILLED' || orderData.X === 'PARTIALLY_FILLED') {
-                // Handle partial fills by updating position quantities
-                if (orderData.X === 'PARTIALLY_FILLED') {
-                    const filledQty = parseFloat(orderData.z);
-                    console.log(`[PARTIAL_FILL] Handling partial fill of ${filledQty}/${orderData.q}`, {
-                        orderId: orderData.i,
-                        remainingQty: parseFloat(orderData.q) - filledQty
-                    });
-
-                    // Update position with filled quantity
-                    currentPosition.quantity += filledQty;
-                    currentPosition.entryValueUSD += filledQty * parseFloat(orderData.p);
-                    currentPosition.averageEntryPrice = currentPosition.entryValueUSD / currentPosition.quantity;
-                }
-
+            // Handle filled orders
+            if (orderData.X === 'FILLED') {
                 if (orderData.o === 'MARKET' && orderData.S === 'BUY') {
                     console.log('Initial market buy order filled.');
                     lastMarketBuyPrice = parseFloat(orderData.p);
@@ -903,13 +880,6 @@ async function cancelAllOpenOrdersAndReset(symbol) {
         console.log(`Verification complete - no open orders remain after ${attempts} attempt(s)`);
         
         // 3. Reset trading environment
-        console.log(`[DEBUG] Resetting trading state for ${symbol}`);
-        console.log(`[STATE_BEFORE_RESET]`, {
-            martingaleLevel: currentMartingaleLevel,
-            position: currentPosition,
-            openOrders: await getOpenOrders(symbol)
-        });
-
         currentPosition = {
             quantity: 0,
             averageEntryPrice: 0,
@@ -920,15 +890,6 @@ async function cancelAllOpenOrdersAndReset(symbol) {
             takeProfitOrderId: null,
             martingaleBuyOrderId: null,
         };
-        currentMartingaleLevel = 0;
-        lastMarketBuyPrice = 0;
-        lastMartingaleBuyPrice = 0;
-
-        console.log(`[STATE_AFTER_RESET]`, {
-            martingaleLevel: currentMartingaleLevel,
-            position: currentPosition,
-            openOrders: await getOpenOrders(symbol)
-        });
         // Reset all trading state variables
         currentMartingaleLevel = 0;
         lastMarketBuyPrice = 0;

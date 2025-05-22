@@ -1284,37 +1284,64 @@ async function placeInitialFollowUpOrders() {
 
 async function placeNextMartingaleStageOrders() {
     if (isCancellingOrders) {
-        console.log('Skipping martingale orders - order cancellation in progress');
+        console.log('[WARN] Skipping martingale orders - order cancellation in progress');
         return;
     }
-    console.log('Placing next martingale stage orders...');
+    
+    console.log('[DEBUG] Starting next martingale stage:', {
+        currentLevel: currentMartingaleLevel,
+        maxLevel: MAX_MARTINGALE_ENTRIES
+    });
+    
     try {
-        // 1. Cancel all existing open orders
-        await cancelAllOpenOrdersAndReset(SYMBOL);
+        // 1. Cancel all existing open orders with detailed logging
+        console.log('[DEBUG] Cancelling all open orders for new martingale stage');
+        const cancelResult = await cancelAllOpenOrdersAndReset(SYMBOL);
+        console.log('[DEBUG] Cancel all orders result:', cancelResult);
         
         // 2. Get current position details from exchange
         const exchangePosition = await getCurrentPosition(SYMBOL);
         if (!exchangePosition) {
-            console.error('No current position found');
+            console.error('[ERROR] No current position found for martingale');
             return;
         }
         
-        // Update current position state with latest from exchange
+        // Update current position state with consistency checks
+        console.log('[DEBUG] Updating position state:', {
+            previousQuantity: currentPosition.quantity,
+            newQuantity: exchangePosition.quantity,
+            previousPrice: currentPosition.averageEntryPrice,
+            newPrice: exchangePosition.averageEntryPrice
+        });
+        
         currentPosition.quantity = exchangePosition.quantity;
         currentPosition.averageEntryPrice = exchangePosition.averageEntryPrice;
+        currentPosition.entryValueUSD = exchangePosition.quantity * exchangePosition.averageEntryPrice;
         
-        // 3. Calculate take profit price including fees for all positions
+        // 3. Calculate take profit price with detailed logging
         const takeProfitPrice = adjustPricePrecision(
             currentPosition.averageEntryPrice *
             (1 + (FEE_LIMIT * MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER))
         );
+        
+        console.log('[DEBUG] Take profit calculation:', {
+            entryPrice: currentPosition.averageEntryPrice,
+            feeMultiplier: MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER,
+            calculatedPrice: takeProfitPrice
+        });
 
         // Cancel any existing take profit orders
         if (currentPosition.takeProfitOrderId) {
+            console.log('[DEBUG] Cancelling existing take profit order:', currentPosition.takeProfitOrderId);
             await cancelOrder(SYMBOL, currentPosition.takeProfitOrderId);
         }
         
-        console.log(`Placing take profit for ${currentPosition.quantity} @ ${takeProfitPrice}`);
+        // Place take profit order
+        console.log('[DEBUG] Placing take profit order:', {
+            quantity: currentPosition.quantity,
+            price: takeProfitPrice
+        });
+        
         const tpOrder = await placeOrder(
             SYMBOL,
             'SELL',
@@ -1326,22 +1353,33 @@ async function placeNextMartingaleStageOrders() {
         
         if (tpOrder) {
             currentPosition.takeProfitOrderId = tpOrder.orderId;
-            console.log('Take profit order placed:', tpOrder);
+            console.log('[DEBUG] Take profit order placed:', {
+                orderId: tpOrder.orderId,
+                price: takeProfitPrice,
+                quantity: currentPosition.quantity
+            });
         }
 
-        // 4. Calculate next martingale buy price and quantity
-        // Calculate required margin for next level
+        // 4. Calculate next martingale buy parameters
+        // First calculate the required variables before margin check
+        const nextBuyPrice = adjustPricePrecision(
+            currentPosition.averageEntryPrice *
+            (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER))
+        );
+        
+        const nextBuyQuantity = currentPosition.quantity * MARTINGALE_MULTIPLIER;
         const requiredMargin = nextBuyQuantity * nextBuyPrice / LEVERAGE;
         const currentBalance = await getAccountBalance();
         
-        // Allow up to 10 levels if sufficient balance (2x required margin)
-        if (currentMartingaleLevel < 10 && currentBalance > requiredMargin * 2) {
-            const nextBuyPrice = adjustPricePrecision(
-                currentPosition.averageEntryPrice *
-                (1 - (FEE_LIMIT * MARTINGALE_DROP_FEE_MULTIPLIER))
-            );
-            
-            const nextBuyQuantity = currentPosition.quantity * MARTINGALE_MULTIPLIER;
+        console.log('[DEBUG] Martingale buy parameters:', {
+            nextBuyPrice: nextBuyPrice,
+            nextBuyQuantity: nextBuyQuantity,
+            requiredMargin: requiredMargin,
+            currentBalance: currentBalance
+        });
+        
+        // Check if we can proceed to next martingale level
+        if (currentMartingaleLevel < MAX_MARTINGALE_ENTRIES && currentBalance > requiredMargin * 2) {
             
             console.log(`Placing next martingale buy for ${nextBuyQuantity} @ ${nextBuyPrice}`);
             const buyOrder = await placeOrder(

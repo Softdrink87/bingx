@@ -48,11 +48,11 @@ const VOLATILITY_COOLDOWN_MULTIPLIER = 2; // Cooldown multiplier for extreme vol
 const MIN_POSITION_SIZE_FACTOR = 0.5; // Minimum position size during high volatility
 
 
-const API_BASE_URL = 'https://open-api.bingx.com';
-const WEBSOCKET_URL = 'wss://open-api-swap.bingx.com/swap-market';
+// const API_BASE_URL = 'https://open-api.bingx.com';
+// const WEBSOCKET_URL = 'wss://open-api-swap.bingx.com/swap-market';
 // For VST (Demo Trading), use:
-// const API_BASE_URL = 'https://open-api-vst.bingx.com';
-// const WEBSOCKET_URL = 'wss://open-api-vst.bingx.com/swap-market';
+const API_BASE_URL = 'https://open-api-vst.bingx.com';
+const WEBSOCKET_URL = 'wss://open-api-vst.bingx.com/swap-market';
 
 
 // ###################################################################################

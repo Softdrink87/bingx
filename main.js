@@ -906,16 +906,16 @@ async function executeInitialMarketBuy() {
             return;
         }
         
-        // INITIAL_EQUITY_PERCENTAGE를 사용하여 수량 계산
-        let quantity = calculateQuantity(currentEquity, INITIAL_EQUITY_PERCENTAGE, currentPrice, LEVERAGE);
-        console.log(`Calculated initial position quantity: ${quantity} BTC based on ${INITIAL_EQUITY_PERCENTAGE * 100}% of equity.`);
+        // 초기 시장가 매수 수량을 0.0001 BTC로 고정
+        let quantity = 0.0001;
+        console.log(`Fixed initial position quantity: ${quantity} BTC.`);
         
-        // 변동성에 따른 포지션 크기 조정 로직 (고정 수량 대신 계산된 수량에 적용)
-        if (currentVolatility > MAX_VOLATILITY_THRESHOLD * 0.7) {
-            const reductionFactor = Math.max(MIN_POSITION_SIZE_FACTOR, 1 - (currentVolatility / MAX_VOLATILITY_THRESHOLD));
-            quantity *= reductionFactor;
-            console.log(`Reducing initial position size to ${(quantity.toFixed(5))} due to elevated volatility (${(currentVolatility*100).toFixed(2)}%).`);
-        }
+        // 변동성에 따른 포지션 크기 조정 로직은 고정 수량에 적용하지 않음
+        // if (currentVolatility > MAX_VOLATILITY_THRESHOLD * 0.7) {
+        //     const reductionFactor = Math.max(MIN_POSITION_SIZE_FACTOR, 1 - (currentVolatility / MAX_VOLATILITY_THRESHOLD));
+        //     quantity *= reductionFactor;
+        //     console.log(`Reducing initial position size to ${(quantity.toFixed(5))} due to elevated volatility (${(currentVolatility*100).toFixed(2)}%).`);
+        // }
         quantity = parseFloat(quantity.toFixed(5)); // 최종 정밀도 확인
 
         if (quantity <=0) {

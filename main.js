@@ -15,6 +15,10 @@ const MARTINGALE_MULTIPLIER = 1.5; // Double the position size for subsequent Ma
 const MAX_MARTINGALE_ENTRIES = 20; // Maximum martingale attempt count
 const EXIT_ROI_THRESHOLD = -0.10; // Position liquidation threshold when ROI <= -10%
 
+// Telegram Bot Configuration
+const TELEGRAM_BOT_TOKEN = "7909240753:AAEpRSMjQpkFsKWUwVfVAyDP4ORjuA__i4g";
+const TELEGRAM_CHAT_ID = "1148538638";
+
 // Fee percentages (as decimals)
 const FEE_LIMIT = 0.000064; // 0.0064%
 const FEE_MARKET = 0.00016;  // 0.016%
@@ -188,6 +192,32 @@ async function apiRequest(method, path, params = {}, needsSignature = true) {
             console.error('Error response status:', error.response.status);
         }
         throw error;
+    }
+}
+
+// ###################################################################################
+// #                          TELEGRAM UTILITIES                                     #
+// ###################################################################################
+
+/**
+ * Sends a message to the configured Telegram chat.
+ * @param {string} message - The message text to send.
+ */
+async function sendTelegramMessage(message) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+        console.warn('Telegram bot token or chat ID not configured. Skipping Telegram message.');
+        return;
+    }
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    try {
+        await axios.post(url, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: 'Markdown' // Use Markdown for formatting
+        });
+        // console.log('Telegram message sent successfully.');
+    } catch (error) {
+        console.error('Error sending Telegram message:', error.response ? error.response.data : error.message);
     }
 }
 
@@ -376,12 +406,13 @@ async function getCurrentPosition(symbol) {
                 return {
                     quantity: parseFloat(longPosition.positionAmt),
                     averageEntryPrice: parseFloat(longPosition.avgPrice),
-                    positionId: longPosition.positionId, 
+                    positionId: longPosition.positionId,
+                    liquidationPrice: parseFloat(longPosition.liqPrice) // 청산가 추가
                 };
             }
         }
         console.log(`No active LONG position found for ${symbol}.`);
-        return null; 
+        return null;
     } catch (error) {
         console.error('Error fetching current position:', error);
         return null;
@@ -645,6 +676,9 @@ async function handleWebSocketMessage(message) {
                 currentPosition.side = 'LONG';
                 initialPositionQuantity = parseFloat(orderData.q); // Set initial quantity global variable
 
+                const message = `✨ *초기 시장가 매수 체결!* ✨\n\n*심볼:* ${orderData.s}\n*수량:* ${parseFloat(orderData.q).toFixed(5)}\n*가격:* ${parseFloat(orderData.p).toFixed(1)} USDT\n*총 가치:* ${tradeValueUSD.toFixed(2)} USDT\n\n*현재 잔액:* ${(await getAccountBalance()).toFixed(2)} USDT\n*총 누적 거래량:* ${totalTradedVolumeUSD.toFixed(2)} USDT`;
+                sendTelegramMessage(message).catch(console.error);
+
                 placeInitialStrategyOrders().catch(console.error); // Call the new strategy function
 
                 volumeStats.trades.push({ quantity: parseFloat(orderData.q), time: Date.now() });
@@ -660,6 +694,9 @@ async function handleWebSocketMessage(message) {
                 currentPosition.averageEntryPrice = ((currentPosition.averageEntryPrice * currentPosition.quantity) + (parseFloat(orderData.p) * parseFloat(orderData.q))) / newQuantity;
                 currentPosition.quantity = newQuantity;
                 currentPosition.entryValueUSD = currentPosition.quantity * currentPosition.averageEntryPrice;
+
+                const message = `💧 *물타기 매수 체결 (레벨 ${currentMartingaleLevel})* 💧\n\n*심볼:* ${orderData.s}\n*수량:* ${parseFloat(orderData.q).toFixed(5)}\n*가격:* ${parseFloat(orderData.p).toFixed(1)} USDT\n*총 가치:* ${tradeValueUSD.toFixed(2)} USDT\n*평균 진입가:* ${currentPosition.averageEntryPrice.toFixed(1)} USDT\n\n*현재 잔액:* ${(await getAccountBalance()).toFixed(2)} USDT\n*총 누적 거래량:* ${totalTradedVolumeUSD.toFixed(2)} USDT`;
+                sendTelegramMessage(message).catch(console.error);
 
 
                 volumeStats.trades.push({ quantity: parseFloat(orderData.q), time: Date.now() });
@@ -694,6 +731,8 @@ async function handleWebSocketMessage(message) {
 
                 if (isBotActive) {
                     console.log('익절 완료. 새로운 거래 사이클을 시작합니다.');
+                    const message = `✅ *익절 완료!* 🎉\n\n*심볼:* ${orderData.s}\n*수량:* ${parseFloat(orderData.q).toFixed(5)}\n*가격:* ${parseFloat(orderData.p).toFixed(1)} USDT\n*총 가치:* ${tradeValueUSD.toFixed(2)} USDT\n\n새로운 사이클 시작. *현재 잔액:* ${(await getAccountBalance()).toFixed(2)} USDT\n*총 누적 거래량:* ${totalTradedVolumeUSD.toFixed(2)} USDT`;
+                    sendTelegramMessage(message).catch(console.error);
                     await executeInitialMarketBuy();
                 }
             }
@@ -1098,6 +1137,7 @@ async function initializeBot() {
         
         setInterval(displayVolumeStats, 5000);
         setInterval(checkAndPlaceMissingOrders, 30000); // 30초마다 누락된 주문 확인 및 재지정
+        setInterval(reportBotStatus, 5 * 60 * 1000); // 5분마다 봇 상태 보고
 
         // Watchdog for bot inactivity - Simplified to avoid recursive initializeBot calls
         setInterval(async () => {
@@ -1118,6 +1158,8 @@ async function initializeBot() {
                     await cancelAllOpenOrdersAndReset(SYMBOL);
                     // 환경 리셋 후 봇을 다시 활성화하고 초기 시장가 매수 실행
                     isBotActive = true; // 봇을 활성화
+                    const message = `⚠️ *비활성 감지 및 환경 리셋* ⚠️\n\n포지션 없음. 새로운 거래 사이클을 시작합니다.\n\n*현재 잔액:* ${(await getAccountBalance()).toFixed(2)} USDT\n*총 누적 거래량:* ${totalTradedVolumeUSD.toFixed(2)} USDT`;
+                    sendTelegramMessage(message).catch(console.error);
                     await executeInitialMarketBuy(); // 새로운 거래 사이클 시작
                 } else {
                     console.log('[Inactivity Check] Conditions for full reset not met. Current position:', currentPos, 'Open orders:', openOrders.map(o => ({id: o.orderId, type: o.type, side: o.side})));
@@ -1188,6 +1230,51 @@ async function checkAndPlaceMissingOrders() {
         }
     } catch (error) {
         console.error('[CheckOrders] Error checking and placing missing orders:', error);
+    }
+}
+
+// ###################################################################################
+// #                          BOT STATUS REPORTING                                   #
+// ###################################################################################
+
+async function reportBotStatus() {
+    if (!isBotActive) {
+        // console.log('Bot is inactive, skipping status report.');
+        return;
+    }
+    try {
+        const balance = await getAccountBalance();
+        const position = await getCurrentPosition(SYMBOL);
+        const currentPrice = await getCurrentBtcPrice();
+
+        let message = `📊 *봇 상태 보고 (${SYMBOL})* 📊\n\n`;
+        message += `💰 *현재 잔액:* ${balance.toFixed(2)} USDT\n`;
+        message += `📈 *현재 가격:* ${currentPrice.toFixed(1)} USDT\n`;
+
+        if (position && position.quantity > 0) {
+            const roi = ((currentPrice - position.averageEntryPrice) / position.averageEntryPrice * 100);
+            const roiEmoji = roi >= 0 ? '🟢' : '🔴';
+            message += `\n💼 *현재 포지션:*\n`;
+            message += `  수량: ${position.quantity.toFixed(5)} BTC\n`;
+            message += `  평균 진입가: ${position.averageEntryPrice.toFixed(1)} USDT\n`;
+            message += `  청산가: ${position.liquidationPrice ? position.liquidationPrice.toFixed(1) + ' USDT' : 'N/A'}\n`;
+            message += `  ROI: ${roiEmoji} ${roi.toFixed(2)}%\n`;
+            message += `  마팅게일 레벨: ${currentMartingaleLevel} / ${MAX_MARTINGALE_ENTRIES} (남은 횟수: ${MAX_MARTINGALE_ENTRIES - currentMartingaleLevel})\n`;
+        } else {
+            message += `\n💼 *현재 포지션:* 없음\n`;
+            message += `  마팅게일 레벨: ${currentMartingaleLevel} / ${MAX_MARTINGALE_ENTRIES} (남은 횟수: ${MAX_MARTINGALE_ENTRIES - currentMartingaleLevel})\n`;
+        }
+
+        message += `\n📊 *총 누적 거래량:* ${totalTradedVolumeUSD.toFixed(2)} USDT`;
+        if (targetVolumeUSD > 0) {
+            message += ` (목표: ${targetVolumeUSD.toFixed(2)} USDT)`;
+        }
+        message += `\n\n_다음 보고까지 5분_`;
+
+        sendTelegramMessage(message).catch(console.error);
+
+    } catch (error) {
+        console.error('Error reporting bot status:', error);
     }
 }
 

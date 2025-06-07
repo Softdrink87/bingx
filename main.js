@@ -6,13 +6,13 @@ const WebSocket = require('ws');
 // ###################################################################################
 // #                          USER CONFIGURATION                                     #
 // ###################################################################################
-const API_KEY = "N6FCCypIiKnpZlB4BnvhYWBHb4iwIqg47RgSmbhVbTK209Nc3O9DPN0tnyUr3z9qDgynFYMgRUNngt39Jy4Nw"
-const SECRET_KEY = "oWLdJW3w4mGguaJHItsWBYoEWelcwwaJt5riUFIpXabDsTy8Tw4qfr58kQHGbPD7LFZAbkmww02kon4FSckA"
+const API_KEY = "ysOA7yXNzO9QXPydEIfLAPAaIIv1CFVE1vtxifkh4Af76rXdEUsRBDSGSuXwiR0nbvNFDBtln5L10Yc7Pw"
+const SECRET_KEY = "bgUpHJOZ2JCDGAdcAy4QTRq4XYjPUn9u4xdchE1UclOmzm8zVcsL2l0mypJVTW23gLFG4Ys7DzQJ3jbpvKA"
 const SYMBOL = "BTC-USDT";
-const LEVERAGE = 100; // 50x leverage
+const LEVERAGE = 50; // 50x leverage
 let INITIAL_EQUITY_PERCENTAGE = 0.02; // 1% of equity for the first trade
-const MARTINGALE_MULTIPLIER = 1.5; // Double the position size for subsequent Martingale entries
-const MAX_MARTINGALE_ENTRIES = 20; // Maximum martingale attempt count
+const MARTINGALE_MULTIPLIER = 1.1; // Double the position size for subsequent Martingale entries
+const MAX_MARTINGALE_ENTRIES = 50; // Maximum martingale attempt count
 const EXIT_ROI_THRESHOLD = -0.10; // Position liquidation threshold when ROI <= -10%
 
 // Telegram Bot Configuration
@@ -25,8 +25,8 @@ const FEE_MARKET = 0.00016;  // 0.016%
 
 // Take Profit / Martingale Entry Logic Percentages (as decimals)
 const INITIAL_TAKE_PROFIT_PERCENTAGE = 0.00032; // 0.032% (Market buy price * (1 + 0.032%))
-const MARTINGALE_DROP_FEE_MULTIPLIER = 7; // Drop by (Limit Fee * 7) for Martingale limit buy
-const MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER = 1.2; // Take profit at (Avg Buy Price * (1 + Limit Fee * 2))
+const MARTINGALE_DROP_FEE_MULTIPLIER = 10; // Drop by (Limit Fee * 7) for Martingale limit buy
+const MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER = 0.8; // Take profit at (Avg Buy Price * (1 + Limit Fee * 2))
 const BASE_SLIPPAGE_PERCENT = 0.002; // 0.2% base slippage tolerance
 const MAX_SLIPPAGE_PERCENT = 0.005; // 0.5% maximum allowed slippage
 const MIN_PROFIT_PERCENT = 0.0005; // 0.05% minimum profit target
@@ -61,7 +61,7 @@ let volumeStats = {
 };
 let currentPosition = { // Stores details of the current aggregated position
     quantity: 0,          // Total quantity in BTC
-    averageEntryPrice: 0,
+    averagentryPrice: 0,
     entryValueUSD: 0,     // Total USD value at entry (without leverage)
     side: 'LONG',
     positionId: null,     // If available from API
@@ -955,7 +955,7 @@ async function placeInitialStrategyOrders() {
 
     try {
         // Take Profit Order (Close Long)
-        const takeProfitPrice = adjustPricePrecision(lastMarketBuyPrice * (1 + MARTINGALE_TAKE_PROFIT_FEE_MULTIPLIER * FEE_LIMIT));
+        const takeProfitPrice = adjustPricePrecision(lastMarketBuyPrice * (1 + INITIAL_TAKE_PROFIT_PERCENTAGE));
         console.log(`[Strategy] Preparing initial take profit (SELL LIMIT): Price=${takeProfitPrice}, Quantity=${initialPositionQuantity}`);
         try {
             const tpOrder = await placeOrder(SYMBOL, 'SELL', 'LONG', 'LIMIT', initialPositionQuantity, takeProfitPrice);
@@ -1136,7 +1136,7 @@ async function initializeBot() {
         }, 30 * 60 * 1000); // every 30 mins
         
         setInterval(displayVolumeStats, 5000);
-        setInterval(checkAndPlaceMissingOrders, 30000); // 30초마다 누락된 주문 확인 및 재지정
+        setInterval(checkPositionAndOrders, 10000); // 10초마다 포지션 및 주문 상태 확인
         setInterval(reportBotStatus, 5 * 60 * 1000); // 5분마다 봇 상태 보고
 
         // Watchdog for bot inactivity - Simplified to avoid recursive initializeBot calls
@@ -1199,6 +1199,119 @@ async function initializeBot() {
         const delay = Math.min(10000 * (1 + Math.random()), 30000);
         console.log(`Attempting to reinitialize bot in ${Math.round(delay/1000)} seconds...`);
         setTimeout(initializeBot, delay);
+    }
+}
+
+async function checkPositionAndOrders() {
+    if (isCancellingOrders || isCoolingDown || !isBotActive) {
+        console.log(`[CheckPositionAndOrders] Skipping check - ${isCancellingOrders ? 'cancellation in progress' : isCoolingDown ? 'cooling down' : 'bot inactive'}.`);
+        return;
+    }
+
+    try {
+        const currentPos = await getCurrentPosition(SYMBOL);
+
+        if (currentPos && currentPos.quantity > 0) {
+            console.log(`[CheckPositionAndOrders] Active position found: ${currentPos.quantity} ${SYMBOL} at avg price ${currentPos.averageEntryPrice}`);
+            const currentPrice = await getCurrentBtcPrice();
+            const roi = ((currentPrice - currentPos.averageEntryPrice) / currentPos.averageEntryPrice);
+
+            console.log(`[CheckPositionAndOrders] Current ROI: ${(roi * 100).toFixed(2)}%`);
+
+            // ROI Liquidation Logic
+            if (roi <= EXIT_ROI_THRESHOLD) {
+                console.warn(`[CheckPositionAndOrders] ROI (${(roi * 100).toFixed(2)}%) is below or equal to EXIT_ROI_THRESHOLD (${(EXIT_ROI_THRESHOLD * 100).toFixed(2)}%). Liquidating position.`);
+                const currentBalance = await getAccountBalance();
+                const message = `🚨 *강제 청산 알림!* 🚨\n\n*심볼:* ${SYMBOL}\n*수량:* ${currentPos.quantity.toFixed(5)}\n*현재 가격:* ${currentPrice.toFixed(1)} USDT\n*ROI:* ${(roi * 100).toFixed(2)}%\n*현재 잔액:* ${currentBalance.toFixed(2)} USDT\n\n낮은 ROI로 인해 포지션이 강제 청산되었습니다. 새로운 사이클을 시작합니다.`;
+                await sendTelegramMessage(message);
+
+                const sellOrder = await placeOrder(SYMBOL, 'SELL', 'LONG', 'MARKET', currentPos.quantity);
+                if (sellOrder) {
+                    console.log('[CheckPositionAndOrders] Market SELL order placed for liquidation.');
+                    await cancelAllOpenOrdersAndReset(SYMBOL);
+                    isBotActive = true; // Ensure bot is active to restart
+                    await executeInitialMarketBuy();
+                } else {
+                    console.error('[CheckPositionAndOrders] Failed to place market SELL order for liquidation.');
+                }
+                return; // Return after handling liquidation
+            }
+
+            // Order Management Logic (if not liquidated)
+            const openOrders = await getOpenOrders(SYMBOL);
+            const hasTPOrder = openOrders.some(o => o.orderId === currentPosition.takeProfitOrderId && o.type === 'LIMIT' && o.side === 'SELL');
+            const hasMartingaleOrder = openOrders.some(o => o.orderId === currentPosition.martingaleBuyOrderId && o.type === 'LIMIT' && o.side === 'BUY');
+
+            if (!hasTPOrder || !hasMartingaleOrder) {
+                console.warn(`[CheckPositionAndOrders] Missing expected orders. TP Order Present: ${hasTPOrder}, Martingale Order Present: ${hasMartingaleOrder}. Re-placing orders.`);
+                // Update currentPosition with fresh data from currentPos
+                currentPosition.quantity = currentPos.quantity;
+                currentPosition.averageEntryPrice = currentPos.averageEntryPrice;
+                await placeNextMartingaleStageOrders();
+            } else {
+                console.log('[CheckPositionAndOrders] All expected TP and Martingale orders are present.');
+            }
+        } else {
+            console.log('[CheckPositionAndOrders] No active LONG position found. Bot is idle or awaiting initial trade.');
+        }
+    } catch (error) {
+        console.error('[CheckPositionAndOrders] Error during periodic check:', error);
+    }
+}
+async function checkPositionAndOrders() {
+    if (isCancellingOrders || isCoolingDown || !isBotActive) {
+        console.log(`[CheckPositionAndOrders] Skipping check - ${isCancellingOrders ? 'cancellation in progress' : isCoolingDown ? 'cooling down' : 'bot inactive'}.`);
+        return;
+    }
+
+    try {
+        const currentPos = await getCurrentPosition(SYMBOL);
+
+        if (currentPos && currentPos.quantity > 0) {
+            console.log(`[CheckPositionAndOrders] Active position found: ${currentPos.quantity} ${SYMBOL} at avg price ${currentPos.averageEntryPrice}`);
+            const currentPrice = await getCurrentBtcPrice();
+            const roi = ((currentPrice - currentPos.averageEntryPrice) / currentPos.averageEntryPrice);
+
+            console.log(`[CheckPositionAndOrders] Current ROI: ${(roi * 100).toFixed(2)}%`);
+
+            // ROI Liquidation Logic
+            if (roi <= EXIT_ROI_THRESHOLD) {
+                console.warn(`[CheckPositionAndOrders] ROI (${(roi * 100).toFixed(2)}%) is below or equal to EXIT_ROI_THRESHOLD (${(EXIT_ROI_THRESHOLD * 100).toFixed(2)}%). Liquidating position.`);
+                const currentBalance = await getAccountBalance();
+                const message = `🚨 *강제 청산 알림!* 🚨\n\n*심볼:* ${SYMBOL}\n*수량:* ${currentPos.quantity.toFixed(5)}\n*현재 가격:* ${currentPrice.toFixed(1)} USDT\n*ROI:* ${(roi * 100).toFixed(2)}%\n*현재 잔액:* ${currentBalance.toFixed(2)} USDT\n\n낮은 ROI로 인해 포지션이 강제 청산되었습니다. 새로운 사이클을 시작합니다.`;
+                await sendTelegramMessage(message);
+
+                const sellOrder = await placeOrder(SYMBOL, 'SELL', 'LONG', 'MARKET', currentPos.quantity);
+                if (sellOrder) {
+                    console.log('[CheckPositionAndOrders] Market SELL order placed for liquidation.');
+                    await cancelAllOpenOrdersAndReset(SYMBOL);
+                    isBotActive = true; // Ensure bot is active to restart
+                    await executeInitialMarketBuy();
+                } else {
+                    console.error('[CheckPositionAndOrders] Failed to place market SELL order for liquidation.');
+                }
+                return; // Return after handling liquidation
+            }
+
+            // Order Management Logic (if not liquidated)
+            const openOrders = await getOpenOrders(SYMBOL);
+            const hasTPOrder = openOrders.some(o => o.orderId === currentPosition.takeProfitOrderId && o.type === 'LIMIT' && o.side === 'SELL');
+            const hasMartingaleOrder = openOrders.some(o => o.orderId === currentPosition.martingaleBuyOrderId && o.type === 'LIMIT' && o.side === 'BUY');
+
+            if (!hasTPOrder || !hasMartingaleOrder) {
+                console.warn(`[CheckPositionAndOrders] Missing expected orders. TP Order Present: ${hasTPOrder}, Martingale Order Present: ${hasMartingaleOrder}. Re-placing orders.`);
+                // Update currentPosition with fresh data from currentPos
+                currentPosition.quantity = currentPos.quantity;
+                currentPosition.averageEntryPrice = currentPos.averageEntryPrice;
+                await placeNextMartingaleStageOrders();
+            } else {
+                console.log('[CheckPositionAndOrders] All expected TP and Martingale orders are present.');
+            }
+        } else {
+            console.log('[CheckPositionAndOrders] No active LONG position found. Bot is idle or awaiting initial trade.');
+        }
+    } catch (error) {
+        console.error('[CheckPositionAndOrders] Error during periodic check:', error);
     }
 }
 
@@ -1298,4 +1411,3 @@ async function reportBotStatus() {
 
 // Start the bot
 initializeBot();
-
